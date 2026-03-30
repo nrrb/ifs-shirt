@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 
 // --- IFS Corner Systems (defaults) ---
 const DEFAULTS = {
@@ -253,7 +253,8 @@ function parseIFSPaste(text) {
 
 // --- Reactive state ---
 const N = ref(5)
-const iterations = ref(5000)
+const iterationsIndex = ref(4) // 10^4 = 10000
+const iterations = computed(() => Math.pow(10, iterationsIndex.value))
 const pointColor = ref('#ffffff')
 const bgColor = ref('#0a0a0f')
 const invertColors = ref(false)
@@ -395,6 +396,14 @@ async function exportGrid() {
   setTimeout(() => { status.value = '' }, 2000)
 }
 
+let renderDebounceTimer = null
+function debouncedRender() {
+  clearTimeout(renderDebounceTimer)
+  renderDebounceTimer = setTimeout(() => renderAll(), 1000)
+}
+
+watch([N, iterationsIndex], debouncedRender)
+
 onMounted(() => {
   renderAll()
 })
@@ -444,12 +453,12 @@ onMounted(() => {
 
       <label>
         Grid size (N): <strong>{{ N }}</strong>
-        <input type="range" min="5" max="20" v-model.number="N" />
+        <input type="range" min="2" max="30" v-model.number="N" />
       </label>
 
       <label>
         Iterations: <strong>{{ iterationsLabel }}</strong>
-        <input type="range" min="1" max="10000" step="1" v-model.number="iterations" />
+        <input type="range" min="0" max="6" step="1" v-model.number="iterationsIndex" />
       </label>
 
       <label>
