@@ -156,6 +156,88 @@ function renderIFS(ctx, fns, iters, pointColor, bgColor, width, height, transpar
   ctx.putImageData(imageData, 0, 0)
 }
 
+function circleOffsets(size) {
+  if (size <= 1) return [[0, 0]]
+  const r = (size - 1) / 2
+  const offsets = []
+  for (let dy = -Math.ceil(r); dy <= Math.ceil(r); dy++) {
+    for (let dx = -Math.ceil(r); dx <= Math.ceil(r); dx++) {
+      if (dx * dx + dy * dy <= r * r + r * 0.5) offsets.push([dx, dy])
+    }
+  }
+  return offsets
+}
+
+async function renderIFSAsync(ctx, fns, iters, pointColor, bgColor, width, height, transparentBg = false, onProgress = null, cancelToken = null, additive = false, pointSize = 1) {
+  if (transparentBg) {
+    ctx.clearRect(0, 0, width, height)
+  } else {
+    ctx.fillStyle = bgColor
+    ctx.fillRect(0, 0, width, height)
+  }
+
+  const bbox = computeBBox(fns, 5000)
+  const bw = bbox.maxX - bbox.minX || 1
+  const bh = bbox.maxY - bbox.minY || 1
+
+  const imageData = ctx.getImageData(0, 0, width, height)
+  const data = imageData.data
+  const col = parseColor(pointColor)
+  const pCum = buildCumProbs(fns)
+
+  const CHUNK = 50000
+  const offsets = circleOffsets(pointSize)
+  let x = 0, y = 0
+  let plotted = 0
+
+  for (let i = 0; i < iters + 50; i++) {
+    const fn = pickFn(fns, pCum)
+    const nx = fn.a * x + fn.b * y + fn.tx
+    const ny = fn.c * x + fn.d * y + fn.ty
+    x = nx; y = ny
+    if (i < 50) continue
+
+    const nx01 = (x - bbox.minX) / bw
+    const ny01 = (y - bbox.minY) / bh
+    const cx = Math.floor(nx01 * (width - 1))
+    const cy = Math.floor((1 - ny01) * (height - 1))
+
+    for (const [dx, dy] of offsets) {
+      const px = cx + dx
+      const py = cy + dy
+      if (px >= 0 && px < width && py >= 0 && py < height) {
+        const idx = (py * width + px) * 4
+        if (additive) {
+          data[idx]     = Math.round(data[idx]     * 0.9 + col.r * 0.1)
+          data[idx + 1] = Math.round(data[idx + 1] * 0.9 + col.g * 0.1)
+          data[idx + 2] = Math.round(data[idx + 2] * 0.9 + col.b * 0.1)
+          data[idx + 3] = Math.min(255, data[idx + 3] + 26)
+        } else {
+          data[idx]     = col.r
+          data[idx + 1] = col.g
+          data[idx + 2] = col.b
+          data[idx + 3] = 255
+        }
+      }
+    }
+
+    plotted++
+    if (plotted % CHUNK === 0) {
+      if (cancelToken && cancelToken.cancelled) {
+        ctx.putImageData(imageData, 0, 0)
+        if (onProgress) onProgress(plotted)
+        return
+      }
+      if (onProgress) onProgress(plotted)
+      ctx.putImageData(imageData, 0, 0)
+      await new Promise(r => setTimeout(r, 0))
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  if (onProgress) onProgress(plotted)
+}
+
 // --- PNG export helpers ---
 function makeCrcTable() {
   const table = new Uint32Array(256)
@@ -207,7 +289,6 @@ function injectPhys(dataURL, ppm) {
 }
 
 // --- IFS paste parser ---
-// Returns { fns, warning } on success or throws a string error message.
 function parseIFSPaste(text) {
   const lines = text.split('\n')
   const rows = []
@@ -216,14 +297,12 @@ function parseIFSPaste(text) {
     const line = raw.trim()
     if (!line || line.startsWith('#')) continue
 
-    // Strip decorations: leading bullet/dash, "Slot N:" label, brackets
     let cleaned = line
-      .replace(/^[-*•]\s*/, '')          // leading bullet
-      .replace(/^Slot\s*\d+\s*:\s*/i, '') // "Slot 1:"
-      .replace(/[\[\]]/g, '')             // brackets
+      .replace(/^[-*•]\s*/, '')
+      .replace(/^Slot\s*\d+\s*:\s*/i, '')
+      .replace(/[\[\]]/g, '')
       .trim()
 
-    // Extract all numbers (including negatives and decimals)
     const nums = cleaned.match(/-?\d+(\.\d+)?([eE][+-]?\d+)?/g)
     if (!nums || nums.length === 0) continue
     if (nums.length !== 7) throw `Expected 7 numbers per line, got ${nums.length} on: "${raw.trim()}"`
@@ -251,9 +330,12 @@ function parseIFSPaste(text) {
   return { fns, warning }
 }
 
-// --- Reactive state ---
+// --- Mode toggle ---
+const singleMode = ref(false)
+
+// --- Grid mode state ---
 const N = ref(5)
-const iterationsIndex = ref(4) // 10^4 = 10000
+const iterationsIndex = ref(4) // 10^4 = 10,000
 const iterations = computed(() => Math.pow(10, iterationsIndex.value))
 const pointColor = ref('#ffffff')
 const bgColor = ref('#0a0a0f')
@@ -263,8 +345,32 @@ const status = ref('')
 
 const effectivePointColor = computed(() => invertColors.value ? '#000000' : pointColor.value)
 const effectiveBgColor    = computed(() => invertColors.value ? '#ffffff' : bgColor.value)
-
 const iterationsLabel = computed(() => iterations.value.toLocaleString())
+
+// --- Single mode state ---
+const SINGLE_IFS_OPTIONS = [
+  { key: 'fern',       label: 'Fern' },
+  { key: 'sierpinski', label: 'Sierpinski' },
+  { key: 'snowflake',  label: 'Snowflake' },
+  { key: 'dragon',     label: 'Dragon' },
+]
+const singleSelectedIFS = ref('fern')
+const singleIterationsIndex = ref(4) // 10^4 = 10,000
+const singleIterations = computed(() => Math.pow(10, singleIterationsIndex.value))
+const singleIterationsLabel = computed(() => singleIterations.value.toLocaleString())
+const singleColorMode = ref('white-on-black') // 'white-on-black' | 'black-on-white'
+const singleTransparentBg = ref(false)
+const singleAdditive = ref(false)
+const singlePointSize = ref(1)
+const singleExportInches = ref(12)
+const singleCanvasRef = ref(null)
+const singleProgress = ref(0)
+const singleRendering = ref(false)
+let singleCancelToken = null
+
+const singlePointColor = computed(() => singleColorMode.value === 'white-on-black' ? '#ffffff' : '#000000')
+const singleBgColor    = computed(() => singleColorMode.value === 'white-on-black' ? '#000000' : '#ffffff')
+const singleCanvasSize = computed(() => Math.max(200, Math.floor(Math.min(window.innerWidth - 280, window.innerHeight - 40))))
 
 // --- Override panel state ---
 const CORNER_OPTIONS = [
@@ -275,7 +381,7 @@ const CORNER_OPTIONS = [
 ]
 const overrideCorner = ref('fern')
 const overrideText = ref('')
-const overrideStatus = ref(null) // { ok: bool, message: string }
+const overrideStatus = ref(null)
 
 function applyOverride() {
   try {
@@ -309,7 +415,6 @@ function setCanvasRef(el, key) {
   else delete canvasRefs.value[key]
 }
 
-// Rows render top-to-bottom: highest j first (j = N-1 at top)
 const gridCells = computed(() => {
   const cells = []
   for (let j = N.value - 1; j >= 0; j--) {
@@ -325,6 +430,7 @@ const cellSize = computed(() => {
   return Math.max(32, Math.floor(maxPx / N.value))
 })
 
+// --- Grid render/export ---
 async function renderAll() {
   const total = N.value * N.value
   let done = 0
@@ -396,13 +502,75 @@ async function exportGrid() {
   setTimeout(() => { status.value = '' }, 2000)
 }
 
+// --- Single mode render/export ---
+async function renderSingle() {
+  const canvas = singleCanvasRef.value
+  if (!canvas) return
+  const sz = singleCanvasSize.value
+  canvas.width = sz
+  canvas.height = sz
+  const ctx = canvas.getContext('2d')
+  const fns = cornerFns.value[singleSelectedIFS.value]
+  if (singleCancelToken) singleCancelToken.cancelled = true
+  singleCancelToken = { cancelled: false }
+  const token = singleCancelToken
+  singleProgress.value = 0
+  singleRendering.value = true
+  status.value = 'Rendering...'
+  await nextTick()
+  await renderIFSAsync(ctx, fns, singleIterations.value, singlePointColor.value, singleBgColor.value, sz, sz, singleTransparentBg.value, (n) => { singleProgress.value = n }, token, singleAdditive.value, singlePointSize.value)
+  singleRendering.value = false
+  status.value = token.cancelled ? 'Stopped.' : 'Done.'
+  setTimeout(() => { status.value = ''; singleProgress.value = 0 }, 2000)
+}
+
+function stopSingle() {
+  if (singleCancelToken) singleCancelToken.cancelled = true
+}
+
+async function exportSingle() {
+  const totalPx = Math.round(300 * singleExportInches.value)
+  const offscreen = document.createElement('canvas')
+  offscreen.width = totalPx
+  offscreen.height = totalPx
+  const ctx = offscreen.getContext('2d')
+  const fns = cornerFns.value[singleSelectedIFS.value]
+  status.value = 'Rendering export...'
+  await new Promise(r => setTimeout(r, 0))
+  renderIFS(ctx, fns, singleIterations.value, singlePointColor.value, singleBgColor.value, totalPx, totalPx, singleTransparentBg.value)
+  status.value = 'Encoding PNG...'
+  await new Promise(r => setTimeout(r, 0))
+  const dataURL = offscreen.toDataURL('image/png')
+  const blob = injectPhys(dataURL, 11811) // 300 DPI = 11811 px/m
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `ifs-${singleSelectedIFS.value}.png`
+  a.click()
+  URL.revokeObjectURL(a.href)
+  status.value = 'Exported!'
+  setTimeout(() => { status.value = '' }, 2000)
+}
+
+// --- Debounced rendering ---
 let renderDebounceTimer = null
 function debouncedRender() {
   clearTimeout(renderDebounceTimer)
   renderDebounceTimer = setTimeout(() => renderAll(), 1000)
 }
 
+let singleRenderDebounceTimer = null
+function debouncedRenderSingle() {
+  clearTimeout(singleRenderDebounceTimer)
+  singleRenderDebounceTimer = setTimeout(() => renderSingle(), 1000)
+}
+
 watch([N, iterationsIndex], debouncedRender)
+watch([singleSelectedIFS, singleIterationsIndex, singleColorMode, singleTransparentBg, singleAdditive, singlePointSize], () => {
+  if (singleMode.value) debouncedRenderSingle()
+})
+watch(singleMode, (val) => {
+  if (val) nextTick(() => renderSingle())
+})
 
 onMounted(() => {
   renderAll()
@@ -411,114 +579,193 @@ onMounted(() => {
 
 <template>
   <div class="app">
-    <div class="grid-area">
-      <div class="grid-wrapper">
-        <span class="clabel clabel-tl">
-          Snowflake<span v-if="overridden.snowflake" class="override-dot" title="Overridden">*</span>
-        </span>
-        <span class="clabel clabel-tr">
-          Dragon<span v-if="overridden.dragon" class="override-dot" title="Overridden">*</span>
-        </span>
-        <div
-          class="grid"
-          :style="{
-            gridTemplateColumns: `repeat(${N}, ${cellSize}px)`,
-            gridTemplateRows: `repeat(${N}, ${cellSize}px)`,
-          }"
-        >
+    <!-- Canvas area -->
+    <div class="canvas-area">
+      <!-- Grid mode -->
+      <div v-if="!singleMode" class="grid-area">
+        <div class="grid-wrapper">
+          <span class="clabel clabel-tl">
+            Snowflake<span v-if="overridden.snowflake" class="override-dot" title="Overridden">*</span>
+          </span>
+          <span class="clabel clabel-tr">
+            Dragon<span v-if="overridden.dragon" class="override-dot" title="Overridden">*</span>
+          </span>
           <div
-            v-for="cell in gridCells"
-            :key="cell.key"
-            class="cell"
-            :style="{ width: cellSize + 'px', height: cellSize + 'px' }"
+            class="grid"
+            :style="{
+              gridTemplateColumns: `repeat(${N}, ${cellSize}px)`,
+              gridTemplateRows: `repeat(${N}, ${cellSize}px)`,
+            }"
           >
-            <canvas
-              :ref="el => setCanvasRef(el, cell.key)"
-              :width="cellSize"
-              :height="cellSize"
-            />
+            <div
+              v-for="cell in gridCells"
+              :key="cell.key"
+              class="cell"
+              :style="{ width: cellSize + 'px', height: cellSize + 'px' }"
+            >
+              <canvas
+                :ref="el => setCanvasRef(el, cell.key)"
+                :width="cellSize"
+                :height="cellSize"
+              />
+            </div>
           </div>
+          <span class="clabel clabel-bl">
+            Fern<span v-if="overridden.fern" class="override-dot" title="Overridden">*</span>
+          </span>
+          <span class="clabel clabel-br">
+            Sierpinski<span v-if="overridden.sierpinski" class="override-dot" title="Overridden">*</span>
+          </span>
         </div>
-        <span class="clabel clabel-bl">
-          Fern<span v-if="overridden.fern" class="override-dot" title="Overridden">*</span>
-        </span>
-        <span class="clabel clabel-br">
-          Sierpinski<span v-if="overridden.sierpinski" class="override-dot" title="Overridden">*</span>
-        </span>
+      </div>
+
+      <!-- Single mode -->
+      <div v-else class="single-area" :class="singleTransparentBg ? 'checkerboard' : ''" :style="{ background: singleTransparentBg ? undefined : singleBgColor }">
+        <canvas ref="singleCanvasRef" :width="singleCanvasSize" :height="singleCanvasSize" class="single-canvas" />
       </div>
     </div>
 
+    <!-- Controls sidebar -->
     <div class="controls">
-      <h2>IFS Grid</h2>
+      <!-- Mode toggle -->
+      <button class="mode-toggle" :class="{ active: singleMode }" @click="singleMode = !singleMode">
+        {{ singleMode ? 'Single IFS' : 'IFS Grid' }}
+      </button>
 
-      <label>
-        Grid size (N): <strong>{{ N }}</strong>
-        <input type="range" min="2" max="30" v-model.number="N" />
-      </label>
+      <!-- Single mode controls -->
+      <template v-if="singleMode">
+        <h2>Single IFS</h2>
 
-      <label>
-        Iterations: <strong>{{ iterationsLabel }}</strong>
-        <input type="range" min="0" max="6" step="1" v-model.number="iterationsIndex" />
-      </label>
+        <label>
+          IFS system
+          <select v-model="singleSelectedIFS">
+            <option v-for="opt in SINGLE_IFS_OPTIONS" :key="opt.key" :value="opt.key">
+              {{ opt.label }}{{ overridden[opt.key] ? ' *' : '' }}
+            </option>
+          </select>
+        </label>
 
-      <label>
-        Point color
-        <input type="color" v-model="pointColor" />
-      </label>
+        <label>
+          Iterations: <strong>{{ singleIterationsLabel }}</strong>
+          <span v-if="singleProgress > 0" class="progress-count">
+            {{ singleProgress.toLocaleString() }} drawn
+            <button v-if="singleRendering" class="btn-stop" @click="stopSingle">Stop</button>
+          </span>
+          <input type="range" min="0" max="7" step="1" v-model.number="singleIterationsIndex" />
+        </label>
 
-      <label>
-        Background color
-        <input type="color" v-model="bgColor" />
-      </label>
+        <label>
+          Colors
+          <select v-model="singleColorMode">
+            <option value="white-on-black">White on Black</option>
+            <option value="black-on-white">Black on White</option>
+          </select>
+        </label>
 
-      <label class="label-row">
-        <input type="checkbox" v-model="invertColors" />
-        Invert colors
-        <span class="invert-hint">(export: transparent bg)</span>
-      </label>
+        <label class="label-row">
+          <input type="checkbox" v-model="singleTransparentBg" />
+          Transparent background
+        </label>
 
-      <label>
-        Export size (inches)
-        <input type="number" min="1" max="60" step="1" v-model.number="exportInches" />
-        <span class="export-px">{{ (300 * exportInches).toLocaleString() }} × {{ (300 * exportInches).toLocaleString() }} px</span>
-      </label>
+        <label class="label-row">
+          <input type="checkbox" v-model="singleAdditive" />
+          Additive blending
+        </label>
 
-      <button @click="renderAll">Re-render</button>
-      <button @click="exportGrid">Export PNG</button>
+        <label>
+          Point size: <strong>{{ singlePointSize }}</strong>
+          <input type="range" min="1" max="10" step="1" v-model.number="singlePointSize" />
+        </label>
 
-      <div v-if="status" class="status">{{ status }}</div>
+        <label>
+          Export size (inches)
+          <input type="number" min="1" max="60" step="1" v-model.number="singleExportInches" />
+          <span class="export-px">{{ (300 * singleExportInches).toLocaleString() }} × {{ (300 * singleExportInches).toLocaleString() }} px</span>
+        </label>
 
-      <!-- Override panel -->
-      <div class="divider" />
-      <h3>Override Corner</h3>
+        <div v-if="status" class="status">{{ status }}</div>
 
-      <label>
-        Corner
-        <select v-model="overrideCorner" @change="overrideStatus = null">
-          <option v-for="opt in CORNER_OPTIONS" :key="opt.key" :value="opt.key">
-            {{ opt.label }}{{ overridden[opt.key] ? ' *' : '' }}
-          </option>
-        </select>
-      </label>
+        <div class="button-row">
+          <button @click="renderSingle">Re-render</button>
+          <button @click="exportSingle">Export PNG</button>
+        </div>
+      </template>
 
-      <label>
-        Paste functions
-        <textarea
-          v-model="overrideText"
-          placeholder="Paste 4 IFS functions here&#10;&#10;Accepted formats:&#10;- Slot 1: [a, b, c, d, tx, ty, p]&#10;[a, b, c, d, tx, ty, p]&#10;a b c d tx ty p"
-          rows="8"
-          spellcheck="false"
-        />
-      </label>
+      <!-- Grid mode controls -->
+      <template v-else>
+        <h2>IFS Grid</h2>
 
-      <div v-if="overrideStatus" class="override-status" :class="overrideStatus.ok ? 'ok' : 'err'">
-        {{ overrideStatus.ok ? '✓' : '✗' }} {{ overrideStatus.message }}
-      </div>
+        <label>
+          Grid size (N): <strong>{{ N }}</strong>
+          <input type="range" min="2" max="30" v-model.number="N" />
+        </label>
 
-      <div class="override-buttons">
-        <button @click="applyOverride">Apply</button>
-        <button class="btn-reset" @click="resetCorner">Reset</button>
-      </div>
+        <label>
+          Iterations: <strong>{{ iterationsLabel }}</strong>
+          <input type="range" min="0" max="6" step="1" v-model.number="iterationsIndex" />
+        </label>
+
+        <label>
+          Point color
+          <input type="color" v-model="pointColor" />
+        </label>
+
+        <label>
+          Background color
+          <input type="color" v-model="bgColor" />
+        </label>
+
+        <label class="label-row">
+          <input type="checkbox" v-model="invertColors" />
+          Invert colors
+          <span class="invert-hint">(export: transparent bg)</span>
+        </label>
+
+        <label>
+          Export size (inches)
+          <input type="number" min="1" max="60" step="1" v-model.number="exportInches" />
+          <span class="export-px">{{ (300 * exportInches).toLocaleString() }} × {{ (300 * exportInches).toLocaleString() }} px</span>
+        </label>
+
+        <div v-if="status" class="status">{{ status }}</div>
+
+        <div class="button-row">
+          <button @click="renderAll">Re-render</button>
+          <button @click="exportGrid">Export PNG</button>
+        </div>
+
+        <!-- Override panel -->
+        <div class="divider" />
+        <h3>Override Corner</h3>
+
+        <label>
+          Corner
+          <select v-model="overrideCorner" @change="overrideStatus = null">
+            <option v-for="opt in CORNER_OPTIONS" :key="opt.key" :value="opt.key">
+              {{ opt.label }}{{ overridden[opt.key] ? ' *' : '' }}
+            </option>
+          </select>
+        </label>
+
+        <label>
+          Paste functions
+          <textarea
+            v-model="overrideText"
+            placeholder="Paste 4 IFS functions here&#10;&#10;Accepted formats:&#10;- Slot 1: [a, b, c, d, tx, ty, p]&#10;[a, b, c, d, tx, ty, p]&#10;a b c d tx ty p"
+            rows="8"
+            spellcheck="false"
+          />
+        </label>
+
+        <div v-if="overrideStatus" class="override-status" :class="overrideStatus.ok ? 'ok' : 'err'">
+          {{ overrideStatus.ok ? '✓' : '✗' }} {{ overrideStatus.message }}
+        </div>
+
+        <div class="button-row">
+          <button @click="applyOverride">Apply</button>
+          <button class="btn-reset" @click="resetCorner">Reset</button>
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -535,13 +782,38 @@ html, body, #app { width: 100%; height: 100%; background: #0a0a0f; color: #ccc; 
   overflow: hidden;
 }
 
-.grid-area {
+.canvas-area {
   flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: auto;
   padding: 16px;
+}
+
+.grid-area {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.single-area {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+.single-area.checkerboard {
+  background-image: repeating-conic-gradient(#444 0% 25%, #222 0% 50%);
+  background-size: 20px 20px;
+}
+
+.single-canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .grid {
@@ -595,13 +867,38 @@ html, body, #app { width: 100%; height: 100%; background: #0a0a0f; color: #ccc; 
 .controls {
   width: 260px;
   min-width: 260px;
-  padding: 20px 16px;
+  padding: 16px;
   background: #111118;
   border-left: 1px solid #222;
   display: flex;
   flex-direction: column;
   gap: 14px;
   overflow-y: auto;
+}
+
+.mode-toggle {
+  flex: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #aaa;
+  border: 1px solid #333;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.15s, color 0.15s;
+  text-align: center;
+}
+
+.mode-toggle.active {
+  background: rgba(0, 229, 255, 0.12);
+  color: #00e5ff;
+  border-color: rgba(0, 229, 255, 0.4);
+}
+
+.mode-toggle:hover {
+  background: rgba(0, 229, 255, 0.1);
+  color: #00e5ff;
 }
 
 .controls h2 {
@@ -701,7 +998,7 @@ textarea:focus {
   background: rgba(248, 113, 113, 0.08);
 }
 
-.override-buttons {
+.button-row {
   display: flex;
   gap: 8px;
 }
@@ -754,5 +1051,28 @@ button:hover {
   font-size: 12px;
   color: #00e5ff;
   opacity: 0.85;
+}
+
+.progress-count {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #00e5ff;
+  opacity: 0.7;
+}
+
+.btn-stop {
+  flex: none;
+  padding: 2px 7px;
+  font-size: 11px;
+  background: rgba(255, 80, 80, 0.12);
+  color: #f87171;
+  border: 1px solid rgba(255, 80, 80, 0.35);
+  border-radius: 4px;
+}
+
+.btn-stop:hover {
+  background: rgba(255, 80, 80, 0.25);
 }
 </style>
